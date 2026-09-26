@@ -20,6 +20,7 @@ import {
   ChevronUp,
   Zap,
   AlertCircle,
+  Activity,
 } from "lucide-react";
 import {
   FinalNetwork,

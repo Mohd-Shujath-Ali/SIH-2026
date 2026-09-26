@@ -14,6 +14,16 @@ function synthesizeForensicPredictions(
   const edges = network.edges;
   const influencers = network.networkMetrics.keyInfluencers;
   const primaryInfluencer = influencers[0] || nodes.find((n) => n.isKeyInfluencer) || nodes[0];
+  const primaryInfluencerId = primaryInfluencer
+    ? "entityId" in primaryInfluencer
+      ? primaryInfluencer.entityId
+      : primaryInfluencer.id
+    : "";
+  const primaryInfluencerScore = primaryInfluencer
+    ? "score" in primaryInfluencer
+      ? primaryInfluencer.score
+      : 0.88
+    : 0.88;
 
   const predictions: PredictionInsight[] = [];
   const now = new Date().toISOString();
@@ -22,11 +32,11 @@ function synthesizeForensicPredictions(
   if (primaryInfluencer && nodes.length > 1) {
     const unlinkedNodes = nodes.filter(
       (n) =>
-        n.id !== primaryInfluencer.entityId &&
+        n.id !== primaryInfluencerId &&
         !edges.some(
           (e) =>
-            (e.sourceId === primaryInfluencer.entityId && e.targetId === n.id) ||
-            (e.targetId === primaryInfluencer.entityId && e.sourceId === n.id)
+            (e.sourceId === primaryInfluencerId && e.targetId === n.id) ||
+            (e.targetId === primaryInfluencerId && e.sourceId === n.id)
         )
     );
     const targetCandidate = unlinkedNodes[0] || nodes[1];
@@ -39,7 +49,7 @@ function synthesizeForensicPredictions(
       probability: 84,
       description: `Tactical telemetry indicates ${primaryInfluencer.name} is likely to activate ${targetCandidate.name} as a secondary conduit to bypass monitored direct channels.`,
       targetEntities: [
-        { id: primaryInfluencer.entityId, name: primaryInfluencer.name, role: primaryInfluencer.role },
+        { id: primaryInfluencerId, name: primaryInfluencer.name, role: primaryInfluencer.role },
         { id: targetCandidate.id, name: targetCandidate.name, role: targetCandidate.role },
       ],
       rationale: `Network centrality analysis reveals isolated sub-clusters. Standard syndicate operating procedure dictates establishing redundancy through peripheral nodes.`,
@@ -59,9 +69,9 @@ function synthesizeForensicPredictions(
       probability: 79,
       description: `Subject ${primaryInfluencer.name} exhibits patterns indicative of pre-flight preparation following seizure of related assets.`,
       targetEntities: [
-        { id: primaryInfluencer.entityId, name: primaryInfluencer.name, role: primaryInfluencer.role },
+        { id: primaryInfluencerId, name: primaryInfluencer.name, role: primaryInfluencer.role },
       ],
-      rationale: `High degree centrality (${primaryInfluencer.score}) concentrates operational risk on this subject. Cross-referencing previous enforcement actions indicates imminent exit window.`,
+      rationale: `High degree centrality (${primaryInfluencerScore}) concentrates operational risk on this subject. Cross-referencing previous enforcement actions indicates imminent exit window.`,
       riskLevel: "CRITICAL",
       suggestedIntervention: `Issue immediate Lookout Circular (LOC) at all international departure points and place financial accounts under PMLA provisional attachment.`,
       generatedAt: now,

@@ -6,6 +6,8 @@ import {
   PredictionInsight,
   PostInvestigationReport,
   RpiStatus,
+  SecondLlmStatus,
+  SecondLlmTestResult,
 } from "../types";
 import {
   FALLBACK_CASES,

@@ -9,6 +9,7 @@ import { NetworkGraphView } from "./components/NetworkGraphView";
 import { PredictionAnalysis } from "./components/PredictionAnalysis";
 import { FeedbackLoop } from "./components/FeedbackLoop";
 import { NewCaseModal } from "./components/NewCaseModal";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { api } from "./services/api";
 import {
   Case,
@@ -361,14 +362,16 @@ export default function App() {
           )}
 
           {activeTab === "second-llm" && (
-            <SecondLlmReasoning
-              activeCase={activeCase}
-              finalNetwork={finalNetwork}
-              documents={documents}
-              firstLlmOutputs={firstLlmOutputs}
-              onRunSecondLlm={handleRunSecondLlm}
-              onNavigateToGraph={() => setActiveTab("network-graph")}
-            />
+            <ErrorBoundary fallbackTitle="Second LLM Deep Reasoning & Graph Generator">
+              <SecondLlmReasoning
+                activeCase={activeCase}
+                finalNetwork={finalNetwork}
+                documents={documents}
+                firstLlmOutputs={firstLlmOutputs}
+                onRunSecondLlm={handleRunSecondLlm}
+                onNavigateToGraph={() => setActiveTab("network-graph")}
+              />
+            </ErrorBoundary>
           )}
 
           {activeTab === "network-graph" && (
