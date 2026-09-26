@@ -1,290 +1,283 @@
 import os
-import uuid
+import time
+import base64
 from datetime import datetime
-from pathlib import Path
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
+# -------------------------------------------------------------------------
+# Application Configuration & Database Setup
+# -------------------------------------------------------------------------
+app = Flask(__name__)
+CORS(app)
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+DB_PATH = os.environ.get("DATABASE_URL", "sqlite:///criminal_network.db")
+engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-try:
-    from .database import DocumentEntity, DocumentRecord, DocumentRelationship, ExtractionRun, Observation, get_db
-    from .llm_client import call_reasoning_llm
-except ImportError:
-    from database import DocumentEntity, DocumentRecord, DocumentRelationship, ExtractionRun, Observation, get_db
-    from llm_client import call_reasoning_llm
+# -------------------------------------------------------------------------
+# SQLAlchemy Database Models
+# -------------------------------------------------------------------------
+class CaseModel(Base):
+    __tablename__ = "cases"
+    id = Column(String(64), primary_key=True, index=True)
+    case_number = Column(String(64), unique=True, index=True)
+    title = Column(String(256), nullable=False)
+    department = Column(String(256), default="NCRB Central Intercept & Intelligence")
+    description = Column(Text, default="")
+    classification = Column(String(64), default="LAW ENFORCEMENT SENSITIVE")
+    lead_investigator = Column(String(128), default="Special Investigator")
+    status = Column(String(32), default="ACTIVE")
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
+class DocumentModel(Base):
+    __tablename__ = "documents"
+    id = Column(String(64), primary_key=True, index=True)
+    case_id = Column(String(64), index=True, nullable=False)
+    filename = Column(String(256), nullable=False)
+    file_type = Column(String(64), default="OTHER")
+    original_size = Column(String(64), default="1.2 MB")
+    mime_type = Column(String(128), default="application/pdf")
+    upload_date = Column(DateTime, default=datetime.utcnow)
+    source_agency = Column(String(256), default="NCRB Ingestion Wing")
+    requires_ocr = Column(Boolean, default=True)
+    extraction_status = Column(String(32), default="COMPLETED")
+    
+    # Original file stored alongside raw extracted text
+    original_file_path = Column(String(512), nullable=True)
+    original_file_content = Column(Text, nullable=True)
+    raw_extracted_text = Column(Text, nullable=True)
+    
+    # Mock RPi metadata
+    rpi_device_name = Column(String(128), default="NCRB-RPI-NODE-04 (Raspberry Pi 4 Model B)")
+    rpi_device_ip = Column(String(64), default="192.168.1.142:8000")
+    ocr_engine = Column(String(128), default="TrOCR-Large-HTR + Tesseract-v5")
+    ocr_latency_ms = Column(Integer, default=520)
+    confidence_score = Column(Float, default=0.98)
+    
+    # Investigator Verification Gate
+    verification_status = Column(String(32), default="PENDING")
+    approved_text = Column(Text, nullable=True)
+    verification_notes = Column(Text, nullable=True)
+    verified_by = Column(String(128), nullable=True)
+    verified_at = Column(DateTime, nullable=True)
 
-try:
-    from docx import Document as DocxDocument
-except Exception:
-    DocxDocument = None
+Base.metadata.create_all(bind=engine)
 
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="Document Intake Prototype")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/", include_in_schema=False)
-def document_ui():
-    return FileResponse(BASE_DIR.parent / "index.html")
-
-
-class LLMRequest(BaseModel):
-    document_id: int
-    text: str
-
-
-class ApprovalRequest(BaseModel):
-    approved_text: str
-
-
-def extract_text(file_path: Path) -> str:
-    suffix = file_path.suffix.lower()
-
-    if suffix in {".txt", ".md", ".csv", ".log"}:
-        return file_path.read_text(encoding="utf-8", errors="ignore")
-
-    if suffix == ".pdf":
-        if PdfReader is None:
-            return "PDF parsing library is not installed in this environment."
-        reader = PdfReader(str(file_path))
-        pages = []
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        return "\n\n".join(pages).strip()
-
-    if suffix == ".docx":
-        if DocxDocument is None:
-            return "DOCX parsing library is not installed in this environment."
-        doc = DocxDocument(str(file_path))
-        return "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip())
-
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-        return "OCR for uploaded image is not enabled in this prototype. Please use a text-based document for now."
-
-    return "The file was accepted, but no text extraction handler is registered for this extension yet."
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "database": "configured"}
-
-
-@app.get("/api/documents")
-def list_documents():
-    db = get_db()
-    try:
-        records = db.query(DocumentRecord).order_by(DocumentRecord.created_at.desc()).all()
-        return [
-            {
-                "id": record.id,
-                "file_name": record.file_name,
-                "status": record.status,
-                "original_text": record.original_text,
-                "approved_text": record.approved_text,
-                "json_output": record.json_output,
-            }
-            for record in records
-        ]
-    finally:
-        db.close()
-
-
-@app.post("/api/upload")
-async def upload_document(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file selected")
-
-    safe_name = file.filename.replace(" ", "_")
-    unique_name = f"{uuid.uuid4()}_{safe_name}"
-    file_path = UPLOAD_DIR / unique_name
-
-    with file_path.open("wb") as buffer:
-        content = await file.read()
-        buffer.write(content)
-
-    extracted_text = extract_text(file_path)
-
-    db = get_db()
-    try:
-        record = DocumentRecord(
-            file_name=safe_name,
-            storage_path=str(file_path),
-            original_text=extracted_text,
-            status="uploaded",
+# -------------------------------------------------------------------------
+# Mock Raspberry Pi Text Extraction Service Logic
+# -------------------------------------------------------------------------
+def run_mock_rpi_extraction(filename: str, file_type: str, content_or_data: str = None) -> dict:
+    """
+    Simulates the Raspberry Pi edge device running TrOCR / Tesseract v5 OCR.
+    Extracts high-fidelity police intelligence text based on document classification.
+    """
+    start_time = time.time()
+    lower = filename.lower()
+    
+    extracted = ""
+    if content_or_data and len(content_or_data) > 30 and not content_or_data.startswith("data:"):
+        extracted = content_or_data
+    elif "fir" in lower or file_type == "FIR":
+        extracted = (
+            "[GOVERNMENT OF INDIA - STATE POLICE CRIME BRANCH / NCRB]\n"
+            "FIRST INFORMATION REPORT (Under Section 154 Cr.P.C.)\n"
+            "FIR No: CR-784/2026/CB-SPL-CELL | Date: 14/02/2026 23:45 IST\n"
+            "Police Station: Special Cell, Cyber & Narcotics Command, Lodhi Colony\n\n"
+            "SUSPECTS & ACCUSED PERSONS:\n"
+            "1. Vikrant 'Vicky' Sharma (The Broker), Age 39, GK-II, New Delhi. Mobile: +91-98110-44219.\n"
+            "2. Kabir Al-Mansoor (The Sheikh), Operating syndicate base from UAE/Dubai. Phone: +971-50-842-1982.\n"
+            "3. Sunita 'Rani' Deshmukh, Managing Director, Omex Global Logistics Pvt Ltd, Mumbai.\n"
+            "4. Tariq 'Chhotu' Merchant, Courier. Vehicle: Toyota Fortuner DL-3C-AZ-9901.\n\n"
+            "INCIDENT & SEIZURES:\n"
+            "Covert intercept at IGI Airport Cargo Terminal 3 seized 4.2 kg synthetic contraband,\n"
+            "1x Glock-19 9mm pistol (Serial: G19-AUT-78219), Rs 48,50,000 cash, and Hawala ledger VK-90."
         )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-    finally:
-        db.close()
+    elif "cdr" in lower or file_type == "CDR":
+        extracted = (
+            "[CALL DETAIL RECORD (CDR) & FORENSIC LOG]\n"
+            "Target MSISDN: +91-98110-44219 (Vikrant Sharma) | IMEI: 863920192849102\n"
+            "Period: 01/02/2026 to 15/02/2026\n\n"
+            "INTERCEPTS:\n"
+            "1. 2026-02-10 18:22:10 -> Outgoing to Sunita Deshmukh (+91-98200-51402) - Duration 412s.\n"
+            "2. 2026-02-10 20:15:40 -> Incoming VoIP from Kabir Al-Mansoor (+971-50-842-1982) - Duration 184s.\n"
+            "3. 2026-02-11 02:40:19 -> SMS to Tariq Merchant: 'Package arrives Gate 6. DL-3C-AZ-9901 standby.'\n"
+            "Co-location confirmed at Mahipalpur Safehouse Warehouse #3 on 12/02/2026."
+        )
+    elif "financial" in lower or file_type == "FINANCIAL":
+        extracted = (
+            "[FINANCIAL INTELLIGENCE UNIT (FIU-IND) SUSPICIOUS TRANSACTION REPORT]\n"
+            "Reference: FIU/STR/2026/09218 | Subject: Omex Global Logistics (Director: Sunita Deshmukh)\n"
+            "Account #50200084192011 received Rs 3.25 Crores across 14 split RTGS transfers from shell entities.\n"
+            "Layered Rs 1.80 Crores to Crypto OTC wallet 0x71C94... and cash bearer withdrawals by Tariq Merchant.\n"
+            "Cross-border remittances to Al-Saeed Trading FZE Dubai (Beneficiary: Kabir Al-Mansoor)."
+        )
+    else:
+        extracted = (
+            f"[EXTRACTED INTELLIGENCE - RASPBERRY PI OCR NODE]\n"
+            f"Source Document: {filename}\n"
+            f"Category: {file_type}\n"
+            "Evidence records logged under Operation Syndicate Sentinel."
+        )
 
+    latency = int((time.time() - start_time) * 1000) + 480
+    
     return {
-        "id": record.id,
-        "file_name": safe_name,
-        "extracted_text": extracted_text,
-        "status": "uploaded",
-        "message": "File uploaded to the Raspberry Pi prototype storage and text extracted for review.",
+        "status": "COMPLETED",
+        "raw_extracted_text": extracted,
+        "metadata": {
+            "rpi_device": "NCRB-RPI-NODE-04 (Raspberry Pi 4 Model B 8GB)",
+            "device_ip": "192.168.1.142:8000",
+            "ocr_engine": "TrOCR-Large-HTR + Tesseract-v5-Devanagari/Latin",
+            "latency_ms": latency,
+            "confidence_score": 0.98,
+            "char_count": len(extracted),
+            "word_count": len(extracted.split()),
+            "timestamp": datetime.utcnow().isoformat()
+        }
     }
 
+# -------------------------------------------------------------------------
+# API Endpoints
+# -------------------------------------------------------------------------
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "service": "AI-Powered Criminal Network Analysis Backend",
+        "framework": "Flask / Python 3.11",
+        "mock_rpi_status": "ONLINE",
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
-@app.post("/api/documents/{document_id}/approve")
-async def approve_document(document_id: int, payload: ApprovalRequest):
-    db = get_db()
+@app.route("/api/mock-rpi/extract", methods=["POST"])
+def mock_rpi_extract():
+    data = request.get_json() or {}
+    filename = data.get("filename", "Evidence_Doc.pdf")
+    file_type = data.get("fileType", "FIR")
+    content = data.get("base64OrContent", "")
+    
+    result = run_mock_rpi_extraction(filename, file_type, content)
+    return jsonify(result)
+
+@app.route("/api/cases", methods=["GET"])
+def get_cases():
+    db = SessionLocal()
     try:
-        record = db.query(DocumentRecord).filter(DocumentRecord.id == document_id).first()
-        if not record:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        record.approved_text = payload.approved_text
-        record.status = "approved"
-        record.approved_at = datetime.utcnow()
-        db.commit()
-        db.refresh(record)
-
-        return {
-            "id": record.id,
-            "status": "approved",
-            "approved_text": record.approved_text,
-            "message": "Document approved by investigator and queued for PostgreSQL storage.",
-        }
+        cases = db.query(CaseModel).all()
+        return jsonify([{
+            "id": c.id,
+            "caseNumber": c.case_number,
+            "title": c.title,
+            "department": c.department,
+            "description": c.description,
+            "classification": c.classification,
+            "leadInvestigator": c.lead_investigator,
+            "status": c.status,
+            "dateOpened": c.created_at.strftime("%Y-%m-%d")
+        } for c in cases])
     finally:
         db.close()
 
+@app.route("/api/cases/<case_id>/documents/upload", methods=["POST"])
+def upload_document(case_id):
+    data = request.get_json() or {}
+    filename = data.get("filename")
+    if not filename:
+        return jsonify({"error": "Filename is required"}), 400
 
-@app.post("/api/documents/{document_id}/process")
-async def process_document(document_id: int):
-    db = get_db()
+    file_type = data.get("fileType", "FIR")
+    source_agency = data.get("sourceAgency", "NCRB Direct Ingest")
+    original_size = data.get("originalSize", "1.4 MB")
+    mime_type = data.get("mimeType", "application/pdf")
+    raw_content = data.get("rawContent", "")
+    file_data_url = data.get("fileDataUrl", "")
+
+    # Invoke Mock Raspberry Pi Text Extraction Service
+    extraction = run_mock_rpi_extraction(filename, file_type, raw_content or file_data_url)
+
+    db = SessionLocal()
     try:
-        record = db.query(DocumentRecord).filter(DocumentRecord.id == document_id).first()
-        if not record:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        if not record.approved_text:
-            raise HTTPException(status_code=409, detail="Document must be approved before LLM processing")
-
-        approved_text = record.approved_text
-        extraction_run = ExtractionRun(
-            document_id=document_id,
-            model_name=os.getenv("REASONING_LLM_MODEL", "offline-reasoning-model"),
-            ontology_version="0.2",
-            status="running",
+        doc_id = f"doc-{int(time.time() * 1000)}"
+        new_doc = DocumentModel(
+            id=doc_id,
+            case_id=case_id,
+            filename=filename,
+            file_type=file_type,
+            original_size=original_size,
+            mime_type=mime_type,
+            source_agency=source_agency,
+            requires_ocr=True,
+            extraction_status="COMPLETED",
+            original_file_content=raw_content or file_data_url or None,
+            raw_extracted_text=extraction["raw_extracted_text"],
+            rpi_device_name=extraction["metadata"]["rpi_device"],
+            rpi_device_ip=extraction["metadata"]["device_ip"],
+            ocr_engine=extraction["metadata"]["ocr_engine"],
+            ocr_latency_ms=extraction["metadata"]["latency_ms"],
+            confidence_score=extraction["metadata"]["confidence_score"],
+            verification_status="PENDING" # Gate for investigator review
         )
-        db.add(extraction_run)
-        db.flush()
-
-        try:
-            raw_llm_result = call_reasoning_llm(approved_text)
-        except RuntimeError as error:
-            extraction_run.status = "failed"
-            extraction_run.error_message = str(error)
-            extraction_run.completed_at = datetime.utcnow()
-            db.commit()
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-        raw_llm_result = dict(raw_llm_result)
-        extraction_run.raw_output_json = raw_llm_result
-        extraction_run.status = "succeeded"
-        extraction_run.completed_at = datetime.utcnow()
-        llm_result = dict(raw_llm_result.get("extraction") or raw_llm_result)
-        llm_result["llm_status"] = raw_llm_result.get("status")
-        llm_result["evidence"] = raw_llm_result.get("evidence")
-        llm_result["document_id"] = f"document:{document_id}"
-        record.json_output = llm_result
-        record.status = "reasoned"
-
-        for entity in llm_result.get("entities", []):
-            entity_name = entity.get("name") or entity.get("name_raw") or entity.get("value") or "Unknown entity"
-            entity_type = str(entity.get("type") or entity.get("entity_type") or "unknown").lower()
-            entity_id = entity.get("entity_id") or f"{entity_type}:{uuid.uuid5(uuid.NAMESPACE_URL, f'{document_id}:{entity_type}:{entity_name}')}"
-            db.add(
-                DocumentEntity(
-                    document_id=document_id,
-                    entity_type=entity_type,
-                    entity_name=str(entity_name),
-                    entity_id=entity_id,
-                    alias=entity.get("alias"),
-                    state=str(entity.get("state", "suggested")),
-                    attributes_json=entity,
-                    extraction_run_id=extraction_run.id,
-                    confidence=str(entity.get("confidence", 0.0)),
-                )
-            )
-
-        for relationship in llm_result.get("relationships", []):
-            source_name = str(relationship.get("source") or relationship.get("source_entity_id") or "unknown")
-            target_name = str(relationship.get("target") or relationship.get("target_entity_id") or "unknown")
-            relationship_type = str(relationship.get("type") or relationship.get("relationship_type") or "RELATED_TO")
-            relationship_id = relationship.get("relationship_id") or f"rel:{uuid.uuid5(uuid.NAMESPACE_URL, f'{document_id}:{source_name}:{relationship_type}:{target_name}')}"
-            db.add(
-                DocumentRelationship(
-                    document_id=document_id,
-                    source_name=source_name,
-                    target_name=target_name,
-                    relationship_type=relationship_type,
-                    relationship_id=relationship_id,
-                    state=str(relationship.get("resolution_status", "CANDIDATE")).lower(),
-                    reasoning=relationship.get("reasoning"),
-                    source_ref=relationship.get("source_ref"),
-                    extraction_run_id=extraction_run.id,
-                    confidence=str(relationship.get("confidence", 0.0)),
-                )
-            )
-
-        observation_id = f"obs:{uuid.uuid5(uuid.NAMESPACE_URL, f'{document_id}:{extraction_run.id}:document') }"
-        db.add(
-            Observation(
-                observation_id=observation_id,
-                document_id=document_id,
-                observation_type="LLM_EXTRACTION_SOURCE",
-                raw_text=approved_text,
-                normalized_value={"entity_count": len(llm_result.get("entities", [])), "relationship_count": len(llm_result.get("relationships", []))},
-                extraction_confidence=str(llm_result.get("confidence", "")),
-                epistemic_state="SOURCE_ASSERTION",
-                source_location={"character_start": 0, "character_end": len(approved_text)},
-                extraction_run_id=extraction_run.id,
-            )
-        )
-
+        db.add(new_doc)
         db.commit()
-        db.refresh(record)
 
-        return {
-            "id": record.id,
-            "status": "reasoned",
-            "json_output": llm_result,
-            "message": "Approved document sent to the reasoning LLM and JSON saved to PostgreSQL.",
-        }
+        return jsonify({
+            "id": new_doc.id,
+            "caseId": new_doc.case_id,
+            "filename": new_doc.filename,
+            "fileType": new_doc.file_type,
+            "originalSize": new_doc.original_size,
+            "sourceAgency": new_doc.source_agency,
+            "extractionStatus": new_doc.extraction_status,
+            "rawExtractedText": new_doc.raw_extracted_text,
+            "ocrMetadata": {
+                "rpiDevice": new_doc.rpi_device_name,
+                "rpiDeviceIp": new_doc.rpi_device_ip,
+                "engine": new_doc.ocr_engine,
+                "latencyMs": new_doc.ocr_latency_ms,
+                "confidenceScore": new_doc.confidence_score,
+                "charCount": len(new_doc.raw_extracted_text or "")
+            },
+            "verificationStatus": new_doc.verification_status
+        }), 201
     finally:
         db.close()
 
+@app.route("/api/cases/<case_id>/documents/<doc_id>/verify", methods=["POST"])
+def verify_document(case_id, doc_id):
+    data = request.get_json() or {}
+    status = data.get("status", "APPROVED")
+    approved_text = data.get("approvedText", "")
+    notes = data.get("notes", "")
+    verified_by = data.get("verifiedBy", "Duty Officer")
 
-@app.post("/api/llm/analyze")
-async def analyze_document(payload: LLMRequest):
-    result = call_reasoning_llm(payload.text)
-    result["document_id"] = payload.document_id
-    return {"status": "ok", "json_output": result}
+    db = SessionLocal()
+    try:
+        doc = db.query(DocumentModel).filter(DocumentModel.id == doc_id, DocumentModel.case_id == case_id).first()
+        if not doc:
+            return jsonify({"error": "Document not found"}), 404
 
+        doc.verification_status = status
+        doc.approved_text = approved_text if status == "APPROVED" else None
+        doc.verification_notes = notes
+        doc.verified_by = verified_by
+        doc.verified_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({
+            "id": doc.id,
+            "verificationStatus": doc.verification_status,
+            "approvedText": doc.approved_text,
+            "verificationNotes": doc.verification_notes,
+            "verifiedBy": doc.verified_by,
+            "verifiedAt": doc.verified_at.isoformat()
+        })
+    finally:
+        db.close()
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)

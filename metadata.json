@@ -1,0 +1,7 @@
+{
+  "name": "AI-Powered Criminal Network Analysis System",
+  "description": "Advanced law enforcement intelligence system for heterogeneous data ingestion, OCR/HTR verification, two-tier LLM reasoning, explainable network graph visualization, and predictive threat analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

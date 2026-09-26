@@ -1,0 +1,8 @@
+# Vercel Ignore File
+node_modules
+.git
+.cache
+Dockerfile*
+docker-compose*
+*.log
+.DS_Store
