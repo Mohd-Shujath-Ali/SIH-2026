@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: criminal_network_backend
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=sqlite:///criminal_network.db
+      - FLASK_ENV=production
+    volumes:
+      - backend_data:/app/data
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: criminal_network_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - backend
+
+volumes:
+  backend_data:
